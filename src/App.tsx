@@ -4,7 +4,7 @@
  */
 
 import React from 'react';
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import {
   LandingPage,
@@ -53,6 +53,7 @@ function RequireAuth({ children }: { children: React.ReactElement }) {
 
 function RequireAdmin({ children }: { children: React.ReactElement }) {
   const { user, loading } = useAuth();
+  const location = useLocation();
   if (loading) {
     return (
       <div className="min-h-screen bg-[#F5F4FB] flex items-center justify-center text-sm text-[#5E5780]">
@@ -61,15 +62,15 @@ function RequireAdmin({ children }: { children: React.ReactElement }) {
     );
   }
   if (!user) {
-    return <Navigate to="/admin/login" replace />;
+    return <Navigate to="/admin/login" state={{ from: location.pathname + location.search }} replace />;
   }
   if (user.role !== 'admin') {
-    return <Navigate to="/dashboard" replace />;
+    return <Navigate to="/admin/login" state={{ from: location.pathname + location.search }} replace />;
   }
   return children;
 }
 
-function RedirectIfAuthenticated({ children }: { children: React.ReactElement }) {
+function RedirectIfAuthenticated({ children, adminOnly = false }: { children: React.ReactElement; adminOnly?: boolean }) {
   const { user, loading } = useAuth();
   if (loading) {
     return (
@@ -78,7 +79,7 @@ function RedirectIfAuthenticated({ children }: { children: React.ReactElement })
       </div>
     );
   }
-  if (user) {
+  if (user && (!adminOnly || user.role === 'admin')) {
     return <Navigate to={user.role === 'admin' ? '/admin' : '/dashboard'} replace />;
   }
   return children;
@@ -93,7 +94,7 @@ export default function App() {
           <Route path="/" element={<LandingPage />} />
           <Route path="/register" element={<RedirectIfAuthenticated><RegisterPage /></RedirectIfAuthenticated>} />
           <Route path="/login" element={<RedirectIfAuthenticated><LoginPage /></RedirectIfAuthenticated>} />
-          <Route path="/admin/login" element={<RedirectIfAuthenticated><LoginPage adminOnly /></RedirectIfAuthenticated>} />
+          <Route path="/admin/login" element={<RedirectIfAuthenticated adminOnly><LoginPage adminOnly /></RedirectIfAuthenticated>} />
 
           {/* Protected Student Workspace */}
           <Route path="/dashboard" element={<RequireAuth><DashboardPage /></RequireAuth>} />

@@ -64,7 +64,7 @@ export function AppShell({
   const handleLogout = async () => {
     setProfileMenuOpen(false);
     await logout();
-    navigate('/login');
+    navigate(user?.role === 'admin' ? '/admin/login' : '/login', { replace: true });
   };
 
   const studentLinks = [

@@ -1,98 +1,46 @@
+import serverless from 'serverless-http';
+import { getUser } from '@netlify/identity';
 import { createExpressApp } from '../../server/app';
 
-interface NetlifyEvent {
-  rawUrl?: string;
-  path: string;
-  httpMethod: string;
-  headers?: Record<string, string | undefined>;
-  body?: string | null;
-  isBase64Encoded?: boolean;
-}
-
-interface NetlifyResponse {
-  statusCode: number;
-  headers: Record<string, string>;
-  body: string;
-}
-
 const app = createExpressApp();
+const handleExpress = serverless(app, {
+  request(request: Record<string, unknown>, _event: unknown, context: { identityUser: unknown }) {
+    request.identityUser = context.identityUser;
+  },
+});
 
-// Lightweight Express adapter for Netlify Functions compatibility
-export const handler = async (event: NetlifyEvent): Promise<NetlifyResponse> => {
-  return new Promise((resolve) => {
-    const reqUrl = event.rawUrl
-      ? new URL(event.rawUrl).pathname + (new URL(event.rawUrl).search || '')
-      : event.path.replace(/^\/\.netlify\/functions\/api/, '/api');
+export function normalizeApiPath(pathname: string): string {
+  const path = pathname.replace(/^\/\.netlify\/functions\/api(?=\/|$)/, '/api');
+  return path === '/api' || path.startsWith('/api/') ? path : `/api${path}`;
+}
 
-    const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries(event.headers || {})) {
-      if (typeof v === 'string') headers[k.toLowerCase()] = v;
-    }
-
-    const bodyBuffer = event.body
-      ? Buffer.from(event.body, event.isBase64Encoded ? 'base64' : 'utf8')
-      : undefined;
-
-    const mockReq: Record<string, unknown> = {
-      method: event.httpMethod,
-      url: reqUrl.startsWith('/api') ? reqUrl : `/api${reqUrl}`,
-      originalUrl: reqUrl.startsWith('/api') ? reqUrl : `/api${reqUrl}`,
-      headers,
-      body: bodyBuffer && headers['content-type']?.includes('application/json')
-        ? JSON.parse(bodyBuffer.toString('utf8'))
-        : undefined,
-    };
-
-    const resHeaders: Record<string, string> = {};
-    let statusCode = 200;
-    const chunks: Buffer[] = [];
-
-    const mockRes: Record<string, unknown> = {
-      statusCode: 200,
-      setHeader(name: string, value: string | string[]) {
-        resHeaders[name.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value);
-      },
-      getHeader(name: string) {
-        return resHeaders[name.toLowerCase()];
-      },
-      status(code: number) {
-        statusCode = code;
-        return mockRes;
-      },
-      json(payload: unknown) {
-        resHeaders['content-type'] = 'application/json';
-        resolve({
-          statusCode,
-          headers: resHeaders,
-          body: JSON.stringify(payload),
-        });
-      },
-      send(payload: unknown) {
-        const str = Buffer.isBuffer(payload) ? payload.toString('utf8') : String(payload ?? '');
-        resolve({
-          statusCode,
-          headers: resHeaders,
-          body: str,
-        });
-      },
-      end(payload?: unknown) {
-        if (payload) chunks.push(Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload)));
-        resolve({
-          statusCode,
-          headers: resHeaders,
-          body: Buffer.concat(chunks).toString('utf8'),
-        });
-      },
-      cookie(name: string, val: string) {
-        resHeaders['set-cookie'] = `${name}=${encodeURIComponent(val)}; Path=/; HttpOnly; SameSite=Lax`;
-        return mockRes;
-      },
-      clearCookie(name: string) {
-        resHeaders['set-cookie'] = `${name}=; Path=/; HttpOnly; Max-Age=0`;
-        return mockRes;
-      },
-    };
-
-    (app as unknown as (req: unknown, res: unknown) => void)(mockReq, mockRes);
+// The modern Functions runtime supplies the verified Identity request context.
+// serverless-http provides real Node request/response streams for Express.
+export default async function handler(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const identityUser = await getUser();
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set('host', url.host);
+  requestHeaders.set('x-forwarded-proto', url.protocol.slice(0, -1));
+  const result = await handleExpress({
+    version: '2.0',
+    rawPath: normalizeApiPath(url.pathname),
+    rawQueryString: url.search.slice(1),
+    headers: Object.fromEntries(requestHeaders),
+    body: Buffer.from(await request.arrayBuffer()).toString('base64'),
+    isBase64Encoded: true,
+    requestContext: { http: { method: request.method, sourceIp: '' } },
+  }, { identityUser }) as {
+    statusCode: number;
+    headers: Record<string, string>;
+    cookies?: string[];
+    body: string;
+    isBase64Encoded: boolean;
+  };
+  const headers = new Headers(result.headers);
+  for (const cookie of result.cookies ?? []) headers.append('set-cookie', cookie);
+  return new Response(result.body ? Buffer.from(result.body, result.isBase64Encoded ? 'base64' : 'utf8') : null, {
+    status: result.statusCode,
+    headers,
   });
-};
+}

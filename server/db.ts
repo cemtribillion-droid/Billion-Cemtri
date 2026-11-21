@@ -1,5 +1,8 @@
-import fs from 'fs';
-import path from 'path';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { RequestHandler } from 'express';
+import { eq } from 'drizzle-orm';
+import { getDatabaseClient } from '../db/index.js';
+import { applicationState } from '../db/schema.js';
 import crypto from 'crypto';
 import type {
   AiLearningHistory,
@@ -25,7 +28,7 @@ import {
 } from '../src/data/nd2QuestionBank';
 
 export interface StoredUserRecord extends UserProfile {
-  password_hash: string;
+  password_hash?: string;
 }
 
 export interface PrepWiseDatabase {
@@ -34,6 +37,7 @@ export interface PrepWiseDatabase {
   topics: Topic[];
   questions: Question[];
   users: StoredUserRecord[];
+  auth_sessions: Array<{ token_hash: string; user_id: string; expires_at: string }>;
   exam_attempts: ExamAttempt[];
   student_answers: StudentAnswer[];
   student_progress: StudentProgress[];
@@ -44,9 +48,6 @@ export interface PrepWiseDatabase {
   platform_settings: PlatformSettings;
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const DB_FILE = path.join(DATA_DIR, 'prepwise-db.json');
-
 function createInitialDb(): PrepWiseDatabase {
   return {
     departments: structuredClone(SEED_DEPARTMENTS),
@@ -54,6 +55,7 @@ function createInitialDb(): PrepWiseDatabase {
     topics: structuredClone(SEED_TOPICS),
     questions: structuredClone(SEED_QUESTIONS),
     users: [],
+    auth_sessions: [],
     exam_attempts: [],
     student_answers: [],
     student_progress: [],
@@ -65,136 +67,67 @@ function createInitialDb(): PrepWiseDatabase {
   };
 }
 
-let cachedDb: PrepWiseDatabase | null = null;
+// Each API request works in a database transaction. The locked row prevents concurrent
+// account changes from overwriting one another, including across function instances.
+const requestDatabase = new AsyncLocalStorage<{ db: PrepWiseDatabase; dirty: boolean }>();
 
 export function readDb(): PrepWiseDatabase {
-  if (cachedDb) {
-    return cachedDb;
-  }
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    if (!fs.existsSync(DB_FILE)) {
-      const initial = createInitialDb();
-      fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2), 'utf8');
-      cachedDb = initial;
-      return cachedDb;
-    }
-    const raw = fs.readFileSync(DB_FILE, 'utf8');
-    const parsed = JSON.parse(raw) as Partial<PrepWiseDatabase>;
-    const initial = createInitialDb();
-
-    const mergeById = <T extends { id: string }>(existing: T[] | undefined, seeded: T[]): { list: T[]; changed: boolean } => {
-      if (!existing?.length) return { list: seeded, changed: false };
-      const seen = new Set(existing.map((item) => item.id));
-      const additions = seeded.filter((item) => !seen.has(item.id));
-      return {
-        list: additions.length > 0 ? [...existing, ...additions] : existing,
-        changed: additions.length > 0,
-      };
-    };
-
-    const deptMerge = mergeById(parsed.departments, initial.departments);
-    const courseMerge = mergeById(parsed.courses, initial.courses);
-    const topicMerge = mergeById(parsed.topics, initial.topics);
-    const questionMerge = mergeById(parsed.questions, initial.questions);
-
-    // Keep seeded course metadata and past-paper question bank synchronized cleanly
-    const seedCourseById = new Map(initial.courses.map((c) => [c.id, c]));
-    let coursesUpdated = false;
-    const syncedCourses = courseMerge.list.map((c) => {
-      const freshCourse = seedCourseById.get(c.id);
-      if (
-        freshCourse &&
-        (c.title !== freshCourse.title ||
-          c.description !== freshCourse.description ||
-          JSON.stringify(c.sessions_available) !== JSON.stringify(freshCourse.sessions_available))
-      ) {
-        coursesUpdated = true;
-        return {
-          ...c,
-          title: freshCourse.title,
-          description: freshCourse.description,
-          sessions_available: freshCourse.sessions_available,
-        };
-      }
-      return c;
-    });
-
-    const seedQuestionById = new Map(initial.questions.map((q) => [q.id, q]));
-    let questionsUpdated = false;
-    const syncedQuestions = questionMerge.list.map((q) => {
-      const fresh = seedQuestionById.get(q.id);
-      if (!fresh) return q;
-
-      const isAdminOverridden = q.verified_by === 'Admin Verified';
-      const hasLegacyFilename =
-        Boolean(q.source_document?.toLowerCase().endsWith('.json')) ||
-        Boolean(q.official_solution_excerpt?.includes('.json')) ||
-        Boolean(q.verified_by?.includes('PDF'));
-
-      if (hasLegacyFilename) {
-        questionsUpdated = true;
-        return {
-          ...fresh,
-          verification_status: isAdminOverridden ? q.verification_status : fresh.verification_status,
-          verified_by: isAdminOverridden ? q.verified_by : fresh.verified_by,
-        };
-      }
-
-      if (!isAdminOverridden && JSON.stringify(q) !== JSON.stringify(fresh)) {
-        questionsUpdated = true;
-        return fresh;
-      }
-
-      return q;
-    });
-
-    const loadedSettings = parsed.platform_settings ?? initial.platform_settings;
-    const settingsMigrated =
-      loadedSettings.platform_name === 'PrepWise' ||
-      loadedSettings.platform_name === 'QuietDesk' ||
-      loadedSettings.platform_name === 'divshinastudy';
-    const syncedSettings = settingsMigrated
-      ? { ...loadedSettings, platform_name: 'Divshinastudy' }
-      : loadedSettings;
-
-    cachedDb = {
-      departments: deptMerge.list,
-      courses: syncedCourses,
-      topics: topicMerge.list,
-      questions: syncedQuestions,
-      users: parsed.users ?? [],
-      exam_attempts: parsed.exam_attempts ?? [],
-      student_answers: parsed.student_answers ?? [],
-      student_progress: parsed.student_progress ?? [],
-      saved_questions: parsed.saved_questions ?? [],
-      ai_learning_history: parsed.ai_learning_history ?? [],
-      pdf_imports: parsed.pdf_imports ?? [],
-      audit_logs: parsed.audit_logs ?? [],
-      platform_settings: syncedSettings,
-    };
-    if (deptMerge.changed || courseMerge.changed || topicMerge.changed || questionMerge.changed || coursesUpdated || questionsUpdated || settingsMigrated) {
-      writeDb(cachedDb);
-    }
-    return cachedDb;
-  } catch {
-    const initial = createInitialDb();
-    cachedDb = initial;
-    return cachedDb;
-  }
+  const state = requestDatabase.getStore();
+  if (!state) throw new Error('Database request context is unavailable.');
+  return state.db;
 }
 
 export function writeDb(db: PrepWiseDatabase): void {
-  cachedDb = db;
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  const tmpFile = `${DB_FILE}.tmp`;
-  fs.writeFileSync(tmpFile, JSON.stringify(db, null, 2), 'utf8');
-  fs.renameSync(tmpFile, DB_FILE);
+  const state = requestDatabase.getStore();
+  if (!state || state.db !== db) throw new Error('Database request context is unavailable.');
+  state.dirty = true;
 }
+
+export interface DatabaseRequestState { db: PrepWiseDatabase; dirty: boolean }
+export type DatabaseTransaction = <T>(work: (state: DatabaseRequestState) => Promise<T>, shouldCommit: () => boolean) => Promise<T>;
+
+const transact: DatabaseTransaction = async (work, shouldCommit) => {
+  return getDatabaseClient().transaction(async (tx) => {
+    await tx.insert(applicationState).values({ id: 'main', data: createInitialDb() }).onConflictDoNothing();
+    const [record] = await tx.select().from(applicationState).where(eq(applicationState.id, 'main')).for('update');
+    const state = { db: { ...createInitialDb(), ...record.data }, dirty: false };
+    const result = await work(state);
+    if (state.dirty && shouldCommit()) {
+      await tx.update(applicationState).set({ data: state.db }).where(eq(applicationState.id, 'main'));
+    }
+    return result;
+  });
+};
+
+export function createDatabaseMiddleware(transaction: DatabaseTransaction = transact): RequestHandler {
+  return (_req, res, next) => {
+    const sendJson = res.json.bind(res);
+    res.setHeader('Cache-Control', 'no-store');
+    void transaction((state) => requestDatabase.run(state, () => new Promise<unknown>((resolve, reject) => {
+      const onClose = () => reject(new Error('Request closed before completion.'));
+      res.once('close', onClose);
+      // Delay the response until COMMIT succeeds, so a failed write cannot look successful.
+      res.json = (body: unknown) => {
+        res.removeListener('close', onClose);
+        resolve(body);
+        return res;
+      };
+      next();
+    })), () => res.statusCode < 400).then((payload) => {
+      res.json = sendJson;
+      sendJson(payload);
+    }).catch(() => {
+      res.json = sendJson;
+      if (!res.headersSent) {
+        res.removeHeader('Set-Cookie');
+        res.status(503);
+        sendJson({ error: 'The account service is temporarily unavailable. Please try again.' });
+      }
+    });
+  };
+}
+
+export const databaseMiddleware = createDatabaseMiddleware();
 
 export function stripSensitiveUserFields(user: StoredUserRecord): UserProfile {
   const {
