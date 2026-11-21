@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import {
   ArrowRight,
   BookOpen,
@@ -9,7 +9,8 @@ import {
   LogOut,
   ShieldCheck,
 } from 'lucide-react';
-import { apiRequest, ApiError } from '../lib/api';
+import { login as identityLogin, requestPasswordRecovery, AuthError, MissingIdentityError } from '@netlify/identity';
+import { apiRequest, ApiError, setSessionToken } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 import { HeroGraduationIllustration, PrepWiseLogo } from '../components/BrandMark';
 import type { Course, Department, UserProfile } from '../types';
@@ -469,224 +470,155 @@ export function RegisterPage() {
 }
 
 export function LoginPage({ adminOnly = false }: { adminOnly?: boolean }) {
-  const { setUser } = useAuth();
+  const { user, setUser, logout } = useAuth();
   const navigate = useNavigate();
-  const [fullName, setFullName] = useState('');
+  const location = useLocation();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [needsAdminSetup, setNeedsAdminSetup] = useState(false);
-  const [setupMode, setSetupMode] = useState(false);
   const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [recovering, setRecovering] = useState(false);
 
   useEffect(() => {
-    if (!adminOnly) {
-      setNeedsAdminSetup(false);
-      setSetupMode(false);
-      return;
-    }
-    apiRequest<{ needs_admin_setup: boolean }>('/api/admin/setup-status')
-      .then((res) => {
-        setNeedsAdminSetup(res.needs_admin_setup);
-        setSetupMode(res.needs_admin_setup);
-      })
-      .catch(() => {});
+    setError('');
+    setMessage('');
+    setPassword('');
   }, [adminOnly]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (submitting || recovering) return;
     setError('');
-
-    if (adminOnly && setupMode) {
-      if (password !== confirmPassword) {
-        setError('Passwords do not match.');
-        return;
-      }
-      setSubmitting(true);
-      try {
-        const res = await apiRequest<{ user: UserProfile }>('/api/admin/setup', {
-          method: 'POST',
-          body: JSON.stringify({
-            full_name: fullName,
-            email,
-            password,
-          }),
-        });
-        setUser(res.user);
-        navigate('/admin');
-      } catch (err) {
-        setError(err instanceof ApiError ? err.message : 'Unable to create administrator account.');
-      } finally {
-        setSubmitting(false);
-      }
-      return;
-    }
-
+    setMessage('');
     setSubmitting(true);
     try {
-      const res = await apiRequest<{ user: UserProfile }>('/api/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ email, password }),
-      });
-      if (adminOnly && res.user.role !== 'admin') {
-        await apiRequest('/api/auth/logout', { method: 'POST' });
-        setError('This portal is restricted to verified Divshinastudy administrators.');
-        return;
+      const normalizedEmail = email.trim().toLowerCase();
+      let profile: UserProfile;
+      try {
+        const signIn = () => apiRequest<{ user: UserProfile }>('/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ email: normalizedEmail, password, admin_only: adminOnly }),
+        });
+        const result = await signIn().catch(async (err) => {
+          // Recover when a valid cookie outlives the app's restored profile.
+          if (!(err instanceof ApiError) || err.status !== 409) throw err;
+          await logout();
+          return signIn();
+        });
+        profile = result.user;
+      } catch (legacyError) {
+        // Existing accounts keep their credentials; invited accounts use Identity.
+        if (!(legacyError instanceof ApiError) || legacyError.status !== 401) throw legacyError;
+        await identityLogin(normalizedEmail, password);
+        setSessionToken(null);
+        const result = await apiRequest<{ user: UserProfile | null }>('/api/auth/me');
+        if (!result.user) {
+          await logout();
+          throw new ApiError('Unable to restore your session. Please sign in again.', 401);
+        }
+        profile = result.user;
       }
-      setUser(res.user);
-      navigate(adminOnly ? '/admin' : '/dashboard');
+      if (adminOnly && profile.role !== 'admin') {
+        await logout();
+        throw new ApiError('This portal is restricted to verified Divshinastudy administrators.', 403);
+      }
+      setUser(profile);
+      const returnTo = location.state?.from;
+      const destination = profile.role === 'admin'
+        ? (typeof returnTo === 'string' && returnTo.startsWith('/admin/') && !returnTo.startsWith('/admin/login') ? returnTo : '/admin')
+        : '/dashboard';
+      navigate(destination, { replace: true });
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Unable to sign in.');
+      if (err instanceof ApiError) setError(err.message);
+      else if (err instanceof MissingIdentityError) setError('Administrator sign-in is temporarily unavailable. Please try again.');
+      else if (err instanceof AuthError) {
+        const unconfirmed = /not confirmed|confirm your email/i.test(err.message);
+        setError(unconfirmed ? 'Confirm your email using the invitation in your inbox before signing in.'
+          : err.status === 400 || err.status === 401 ? 'Invalid email or password.'
+          : err.status === 429 ? 'Too many sign-in attempts. Please wait before trying again.'
+          : 'Unable to sign in right now. Please try again.');
+      } else setError('Unable to sign in. Check your connection and try again.');
     } finally {
       setSubmitting(false);
     }
   };
 
-  const isAdminSetupView = adminOnly && setupMode;
+  const recoverPassword = async () => {
+    if (recovering || submitting) return;
+    setError('');
+    setMessage('');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      setError('Enter your administrator email address to request a password reset.');
+      return;
+    }
+    setRecovering(true);
+    try {
+      await requestPasswordRecovery(email.trim().toLowerCase());
+      setMessage('If an invited account uses this email, a password reset link has been sent.');
+    } catch {
+      setError('Unable to send a reset link right now. Please try again.');
+    } finally {
+      setRecovering(false);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#F5F4FB] flex flex-col justify-center py-10 px-4">
       <div className="max-w-md w-full mx-auto space-y-6">
-        <div className="flex justify-center">
-          <Link to="/">
-            <PrepWiseLogo light={false} />
-          </Link>
-        </div>
-
+        <div className="flex justify-center"><Link to="/"><PrepWiseLogo light={false} /></Link></div>
         <div className="prepwise-card p-7 sm:p-8">
           <div className="mb-6">
             <div className="flex items-center gap-2">
               {adminOnly && <ShieldCheck className="w-5 h-5 text-[#6B34E8]" />}
               <h1 className="font-display text-2xl font-bold text-[#1A1635]">
-                {isAdminSetupView
-                  ? 'Administrator Setup'
-                  : adminOnly
-                  ? 'Administrator Sign In'
-                  : 'Sign In to Divshinastudy'}
+                {adminOnly ? 'Administrator Sign In' : 'Sign In to Divshinastudy'}
               </h1>
             </div>
             <p className="text-sm text-[#5E5780] mt-1">
-              {isAdminSetupView
-                ? 'No administrator exists yet. Create the initial Divshinastudy administrator account.'
-                : adminOnly
-                ? 'Authorized ND2 academic content and platform managers only.'
-                : 'Enter your individual student credentials to continue.'}
+              {adminOnly ? 'Authorized ND2 academic content and platform managers only.' : 'Enter your individual student credentials to continue.'}
             </p>
           </div>
-
-          {error && (
-            <div role="alert" className="mb-4 p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs font-medium text-rose-700">
-              {error}
-            </div>
-          )}
-
-          <form onSubmit={handleSubmit} className="space-y-4">
-            {isAdminSetupView && (
-              <div>
-                <label htmlFor="admin-setup-name" className="block text-xs font-semibold text-[#1A1635] mb-1.5">
-                  Full Name
-                </label>
-                <input
-                  id="admin-setup-name"
-                  type="text"
-                  required
-                  minLength={2}
-                  value={fullName}
-                  onChange={(e) => setFullName(e.target.value)}
-                  placeholder="e.g. Dr. Adewale Ogunleye"
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-[#DED9F2] text-sm focus:outline-none focus:ring-2 focus:ring-[#7B3FE4]/30 focus:border-[#7B3FE4]"
-                />
-              </div>
-            )}
-
-            <div>
-              <label htmlFor="login-email" className="block text-xs font-semibold text-[#1A1635] mb-1.5">
-                {isAdminSetupView ? 'Administrator Email' : 'Email Address'}
-              </label>
-              <input
-                id="login-email"
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder={adminOnly ? 'admin@institution.edu.ng' : 'you@example.com'}
-                className="w-full px-3.5 py-2.5 rounded-xl border border-[#DED9F2] text-sm focus:outline-none focus:ring-2 focus:ring-[#7B3FE4]/30 focus:border-[#7B3FE4]"
-              />
-            </div>
-
-            <div>
-              <label htmlFor="login-password" className="block text-xs font-semibold text-[#1A1635] mb-1.5">
-                {isAdminSetupView ? 'Password (min. 8 characters)' : 'Password'}
-              </label>
-              <input
-                id="login-password"
-                type="password"
-                required
-                minLength={isAdminSetupView ? 8 : undefined}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl border border-[#DED9F2] text-sm focus:outline-none focus:ring-2 focus:ring-[#7B3FE4]/30 focus:border-[#7B3FE4]"
-              />
-            </div>
-
-            {isAdminSetupView && (
-              <div>
-                <label htmlFor="admin-setup-confirm" className="block text-xs font-semibold text-[#1A1635] mb-1.5">
-                  Confirm Password
-                </label>
-                <input
-                  id="admin-setup-confirm"
-                  type="password"
-                  required
-                  minLength={8}
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-[#DED9F2] text-sm focus:outline-none focus:ring-2 focus:ring-[#7B3FE4]/30 focus:border-[#7B3FE4]"
-                />
-              </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={submitting}
-              className="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-[#7B3FE4] to-[#6327E3] text-white text-sm font-semibold hover:opacity-95 disabled:opacity-60 transition-opacity"
-            >
-              {submitting
-                ? isAdminSetupView
-                  ? 'Creating Administrator...'
-                  : 'Signing In...'
-                : isAdminSetupView
-                ? 'Create Administrator Account'
-                : adminOnly
-                ? 'Access Admin Console'
-                : 'Sign In'}
-            </button>
-          </form>
-
-          <div className="mt-5 pt-4 border-t border-[#F0EDF8] flex flex-col gap-2 text-xs text-center text-[#5E5780]">
-            {adminOnly && needsAdminSetup && (
-              <button
-                type="button"
-                onClick={() => {
-                  setError('');
-                  setSetupMode((prev) => !prev);
-                }}
-                className="font-semibold text-[#6B34E8] hover:underline"
-              >
-                {setupMode ? 'Already have an administrator account? Sign in' : 'First time here? Create initial administrator account'}
+          {error && <div role="alert" className="mb-4 p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs font-medium text-rose-700">{error}</div>}
+          {message && <div role="status" className="mb-4 p-3 rounded-xl bg-emerald-50 text-xs text-emerald-800">{message}</div>}
+          {adminOnly && user ? (
+            <div className="space-y-4 text-sm text-[#5E5780]">
+              <p>You are signed in with a student account. Sign out to use your administrator account.</p>
+              <button type="button" disabled={submitting} className="w-full py-2.5 rounded-xl bg-[#6B34E8] text-white disabled:opacity-60"
+                onClick={async () => { setSubmitting(true); await logout(); setSubmitting(false); }}>
+                {submitting ? 'Signing out...' : 'Sign out and use administrator account'}
               </button>
-            )}
-            {!adminOnly && (
-              <span>
-                New ND2 student?{' '}
-                <Link to="/register" className="font-semibold text-[#6B34E8] hover:underline">
-                  Create an account
-                </Link>
-              </span>
-            )}
+            </div>
+          ) : (
+            <form onSubmit={handleSubmit} className="space-y-4" aria-busy={submitting}>
+              <div>
+                <label htmlFor="login-email" className="block text-xs font-semibold text-[#1A1635] mb-1.5">Email Address</label>
+                <input id="login-email" name="email" type="email" required autoComplete="username" autoCapitalize="none" spellCheck={false}
+                  value={email} onChange={(event) => setEmail(event.target.value)} disabled={submitting || recovering}
+                  placeholder={adminOnly ? 'admin@institution.edu.ng' : 'you@example.com'}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-[#DED9F2] text-sm focus:outline-none focus:ring-2 focus:ring-[#7B3FE4]/30 focus:border-[#7B3FE4]" />
+              </div>
+              <div>
+                <label htmlFor="login-password" className="block text-xs font-semibold text-[#1A1635] mb-1.5">Password</label>
+                <input id="login-password" name="password" type="password" required autoComplete="current-password"
+                  value={password} onChange={(event) => setPassword(event.target.value)} disabled={submitting || recovering}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-[#DED9F2] text-sm focus:outline-none focus:ring-2 focus:ring-[#7B3FE4]/30 focus:border-[#7B3FE4]" />
+              </div>
+              <button type="submit" disabled={submitting || recovering}
+                className="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-[#7B3FE4] to-[#6327E3] text-white text-sm font-semibold hover:opacity-95 disabled:opacity-60 transition-opacity">
+                {submitting ? 'Signing In...' : adminOnly ? 'Access Admin Console' : 'Sign In'}
+              </button>
+              {adminOnly && <button type="button" disabled={recovering || submitting} onClick={() => void recoverPassword()}
+                className="w-full text-xs font-semibold text-[#6B34E8] hover:underline disabled:opacity-60">
+                {recovering ? 'Sending reset link...' : 'Forgot password?'}
+              </button>}
+            </form>
+          )}
+          <div className="mt-5 pt-4 border-t border-[#F0EDF8] flex flex-col gap-2 text-xs text-center text-[#5E5780]">
+            {adminOnly && <p>Administrator accounts require an invitation from the site owner.</p>}
+            {!adminOnly && <span>New ND2 student? <Link to="/register" className="font-semibold text-[#6B34E8] hover:underline">Create an account</Link></span>}
             <Link to={adminOnly ? '/login' : '/admin/login'} className="text-[#6D658F] hover:text-[#1A1635]">
-              {adminOnly ? '<- Student Sign In' : 'Administrator Login ->'}
+              {adminOnly ? '← Student Sign In' : 'Administrator Login →'}
             </Link>
           </div>
         </div>

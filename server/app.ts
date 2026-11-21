@@ -2,9 +2,11 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import cookieParser from 'cookie-parser';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
+import type { User as IdentityUser } from '@netlify/identity';
 import multer from 'multer';
 import { PDFParse } from 'pdf-parse';
 import {
+  databaseMiddleware,
   readDb,
   recordAuditLog,
   stripSensitiveUserFields,
@@ -47,59 +49,28 @@ const upload = multer({
   limits: { fileSize: 20 * 1024 * 1024 },
 });
 
-function getSessionSecret(): string {
-  if (process.env.AUTH_SESSION_SECRET && process.env.AUTH_SESSION_SECRET.length >= 16) {
-    return process.env.AUTH_SESSION_SECRET;
-  }
-  const seed = process.env.GEMINI_API_KEY || process.env.APP_URL || process.cwd();
-  return crypto.createHash('sha256').update(`prepwise-session-${seed}`).digest('hex');
+function sessionTokenHash(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 
 function signSessionToken(userId: string): string {
-  const payload = Buffer.from(
-    JSON.stringify({ uid: userId, iat: Date.now() }),
-    'utf8'
-  ).toString('base64url');
-  const sig = crypto.createHmac('sha256', getSessionSecret()).update(payload).digest('base64url');
-  return `${payload}.${sig}`;
+  const db = readDb();
+  const token = crypto.randomBytes(32).toString('base64url');
+  db.auth_sessions = db.auth_sessions.filter((session) => Date.parse(session.expires_at) > Date.now());
+  db.auth_sessions.push({
+    token_hash: sessionTokenHash(token),
+    user_id: userId,
+    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  writeDb(db);
+  return token;
 }
 
-function verifySessionToken(token: string | undefined): string | null {
-  if (!token || !token.includes('.')) return null;
-  const [payload, sig] = token.split('.');
-  if (!payload || !sig) return null;
-  const expectedSig = crypto
-    .createHmac('sha256', getSessionSecret())
-    .update(payload)
-    .digest('base64url');
-  const sigBuf = Buffer.from(sig);
-  const expBuf = Buffer.from(expectedSig);
-  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
-      uid?: string;
-      iat?: number;
-    };
-    if (!parsed.uid) return null;
-    // 7 day session expiry
-    if (parsed.iat && Date.now() - parsed.iat > 7 * 24 * 60 * 60 * 1000) return null;
-    return parsed.uid;
-  } catch {
-    return null;
-  }
-}
-
-function isBootstrapAdminEmail(email: string): boolean {
-  const raw = process.env.ADMIN_BOOTSTRAP_EMAILS || '';
-  if (!raw.trim()) return false;
-  const normalized = email.trim().toLowerCase();
-  return raw
-    .split(',')
-    .map((e) => e.trim().toLowerCase())
-    .filter(Boolean)
-    .includes(normalized);
+function verifySessionToken(token: unknown): string | null {
+  if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
+  const hash = sessionTokenHash(token);
+  const session = readDb().auth_sessions.find((item) => item.token_hash === hash);
+  return session && Date.parse(session.expires_at) > Date.now() ? session.user_id : null;
 }
 
 function toPublicQuestion(q: Question): QuestionPublic {
@@ -115,6 +86,7 @@ function toPublicQuestion(q: Question): QuestionPublic {
 
 interface AuthedRequest extends Request {
   authUser?: StoredUserRecord;
+  identityUser?: IdentityUser | null;
 }
 
 function isHttpsRequest(req: Request): boolean {
@@ -128,14 +100,43 @@ function setSessionCookie(req: Request, res: Response, token: string): void {
   const secure = isHttpsRequest(req);
   res.cookie(SESSION_COOKIE, token, {
     httpOnly: true,
-    sameSite: secure ? 'none' : 'lax',
+    sameSite: 'lax',
     secure,
     path: '/',
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 }
 
-function getAuthenticatedUser(req: Request): StoredUserRecord | null {
+function getAuthenticatedUser(req: AuthedRequest): StoredUserRecord | null {
+  const identity = req.identityUser;
+  if (identity?.email) {
+    const db = readDb();
+    const id = `identity:${identity.id}`;
+    let profile = db.users.find((user) => user.id === id);
+    const authorization = identity.appMetadata?.authorization;
+    const configuredRoles = authorization && typeof authorization === 'object' && 'roles' in authorization
+      ? authorization.roles : [];
+    const isAdmin = [identity.roles, configuredRoles].some((roles) => Array.isArray(roles) && roles.includes('admin'));
+    const role = isAdmin ? 'admin' : 'student';
+    if (!profile) {
+      const department = db.departments[0];
+      const now = new Date().toISOString();
+      profile = {
+        id, email: identity.email, full_name: identity.name || identity.email,
+        department_id: department.id, department_name: department.name,
+        academic_level: 'ND2', role, preferred_semester: 'Second Semester',
+        study_goal_minutes_daily: 45, created_at: now, updated_at: now,
+      };
+      db.users.push(profile);
+      writeDb(db);
+    } else if (profile.role !== role || profile.email !== identity.email) {
+      profile.role = role;
+      profile.email = identity.email;
+      profile.updated_at = new Date().toISOString();
+      writeDb(db);
+    }
+    return profile;
+  }
   const authHeader = req.headers.authorization;
   const bearerToken =
     typeof authHeader === 'string' && authHeader.toLowerCase().startsWith('bearer ')
@@ -224,15 +225,33 @@ function updateStudentTopicProgress(
   rec.last_practiced_at = new Date().toISOString();
 }
 
-export function createExpressApp(): express.Express {
+export function createExpressApp(options: { databaseMiddleware?: express.RequestHandler } = {}): express.Express {
   const app = express();
   app.use(express.json({ limit: '5mb' }));
   app.use(cookieParser());
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && req.headers.origin) {
+      const expectedHost = req.get('host');
+      try {
+        if (new URL(req.headers.origin).host !== expectedHost) {
+          res.status(403).json({ error: 'This request must come from this site.' });
+          return;
+        }
+      } catch {
+        res.status(403).json({ error: 'Invalid request origin.' });
+        return;
+      }
+    }
+    next();
+  });
 
   // Health Check
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'Divshinastudy API', academic_level: 'ND2' });
   });
+
+  app.use('/api', options.databaseMiddleware ?? databaseMiddleware);
 
   // ================= PUBLIC CATALOG (NO QUESTION ANSWERS OR DEMO LOGINS) =================
   app.get('/api/public/catalog', (_req, res) => {
@@ -306,7 +325,7 @@ export function createExpressApp(): express.Express {
 
       const semester = preferred_semester ? normalizeSemester(preferred_semester) : 'Second Semester';
       const password_hash = await bcrypt.hash(password, 10);
-      const assignedRole = isBootstrapAdminEmail(normalizedEmail) ? 'admin' : 'student';
+      const assignedRole = 'student';
 
       const now = new Date().toISOString();
       const newUser: StoredUserRecord = {
@@ -348,8 +367,8 @@ export function createExpressApp(): express.Express {
         return;
       }
 
-      const { email, password } = req.body as { email?: string; password?: string };
-      if (!email || !password) {
+      const { email, password, admin_only } = req.body ?? {};
+      if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
         res.status(400).json({ error: 'Email and password are required.' });
         return;
       }
@@ -362,16 +381,15 @@ export function createExpressApp(): express.Express {
         return;
       }
 
-      const valid = await bcrypt.compare(password, user.password_hash);
+      const valid = user.password_hash ? await bcrypt.compare(password, user.password_hash) : false;
       if (!valid) {
         res.status(401).json({ error: 'Invalid email or password.' });
         return;
       }
 
-      if (isBootstrapAdminEmail(normalizedEmail) && user.role !== 'admin') {
-        user.role = 'admin';
-        user.updated_at = new Date().toISOString();
-        writeDb(db);
+      if (admin_only === true && user.role !== 'admin') {
+        res.status(403).json({ error: 'This portal is restricted to verified Divshinastudy administrators.' });
+        return;
       }
 
       const sessionToken = signSessionToken(user.id);
@@ -384,8 +402,15 @@ export function createExpressApp(): express.Express {
   });
 
   app.post('/api/auth/logout', (req, res) => {
+    const db = readDb();
+    const bearer = req.get('authorization')?.replace(/^Bearer\s+/i, '');
+    const hashes = [bearer, req.cookies?.[SESSION_COOKIE]]
+      .filter((value): value is string => typeof value === 'string')
+      .map(sessionTokenHash);
+    db.auth_sessions = db.auth_sessions.filter((session) => !hashes.includes(session.token_hash));
+    writeDb(db);
     const secure = isHttpsRequest(req);
-    res.clearCookie(SESSION_COOKIE, { path: '/', sameSite: secure ? 'none' : 'lax', secure });
+    res.clearCookie(SESSION_COOKIE, { path: '/', sameSite: 'lax', secure });
     res.json({ ok: true });
   });
 
@@ -1164,87 +1189,12 @@ export function createExpressApp(): express.Express {
     }
   });
 
-  // ================= ONE-TIME ADMIN SETUP =================
+  // Administrator accounts are provisioned by invitation, never by a public setup form.
   app.get('/api/admin/setup-status', (_req, res) => {
-    const db = readDb();
-    const hasAdmin = db.users.some((u) => u.role === 'admin');
-    res.json({ needs_admin_setup: !hasAdmin });
+    res.json({ needs_admin_setup: false, invitation_required: true });
   });
-
-  app.post('/api/admin/setup', async (req, res) => {
-    try {
-      if (getAuthenticatedUser(req)) {
-        res.status(409).json({ error: 'You are already signed in. Please sign out first.' });
-        return;
-      }
-
-      const db = readDb();
-      if (db.users.some((u) => u.role === 'admin')) {
-        res.status(403).json({ error: 'Administrator setup is already complete. Sign in with your administrator credentials.' });
-        return;
-      }
-
-      const { full_name, email, password } = req.body as Record<string, unknown>;
-      if (typeof full_name !== 'string' || full_name.trim().length < 2) {
-        res.status(400).json({ error: 'Please enter your full name (at least 2 characters).' });
-        return;
-      }
-      if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-        res.status(400).json({ error: 'Please enter a valid administrator email address.' });
-        return;
-      }
-      if (typeof password !== 'string' || password.length < 8) {
-        res.status(400).json({ error: 'Password must be at least 8 characters long.' });
-        return;
-      }
-
-      const normalizedEmail = email.trim().toLowerCase();
-      if (db.users.some((u) => u.email.toLowerCase() === normalizedEmail)) {
-        res.status(409).json({
-          error: 'An account with this email already exists. Use a separate administrator email or sign in if configured via ADMIN_BOOTSTRAP_EMAILS.',
-        });
-        return;
-      }
-
-      const defaultDept = db.departments[0] ?? { id: 'dept-com', name: 'Computer Technology' };
-      const password_hash = await bcrypt.hash(password, 10);
-      const now = new Date().toISOString();
-      const newAdmin: StoredUserRecord = {
-        id: `adm-${crypto.randomUUID()}`,
-        full_name: full_name.trim(),
-        email: normalizedEmail,
-        department_id: defaultDept.id,
-        department_name: defaultDept.name,
-        academic_level: 'ND2',
-        role: 'admin',
-        preferred_semester: 'Second Semester',
-        study_goal_minutes_daily: 45,
-        password_hash,
-        created_at: now,
-        updated_at: now,
-      };
-
-      db.users.push(newAdmin);
-      recordAuditLog(
-        db,
-        { id: newAdmin.id, email: newAdmin.email },
-        'ADMIN_SETUP_COMPLETED',
-        'profile',
-        newAdmin.id,
-        'Completed initial administrator account setup'
-      );
-      writeDb(db);
-
-      const sessionToken = signSessionToken(newAdmin.id);
-      setSessionCookie(req, res, sessionToken);
-
-      res.status(201).json({
-        user: stripSensitiveUserFields(newAdmin),
-        session_token: sessionToken,
-      });
-    } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to complete administrator setup.' });
-    }
+  app.post('/api/admin/setup', (_req, res) => {
+    res.status(403).json({ error: 'Administrator accounts require an invitation from the site owner.' });
   });
 
   // ================= ADMIN PORTAL =================
@@ -1552,6 +1502,14 @@ export function createExpressApp(): express.Express {
       res.status(404).json({ error: 'User not found.' });
       return;
     }
+    if (target.id.startsWith('identity:')) {
+      res.status(400).json({ error: 'Manage this administrator’s access through Identity.' });
+      return;
+    }
+    if (target.id === req.authUser!.id && role !== 'admin') {
+      res.status(400).json({ error: 'You cannot remove your own administrator access.' });
+      return;
+    }
     target.role = role;
     target.updated_at = new Date().toISOString();
     recordAuditLog(db, req.authUser!, 'ROLE_CHANGED', 'user_role', target.id, `Set ${target.email} role to ${role}`);
@@ -1599,6 +1557,14 @@ export function createExpressApp(): express.Express {
     recordAuditLog(db, req.authUser!, 'SETTINGS_UPDATED', 'platform_settings', '1', 'Updated ND2 examination & platform settings');
     writeDb(db);
     res.json({ settings: s });
+  });
+
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+  app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const status = error instanceof SyntaxError ? 400 : 500;
+    res.status(status).json({ error: status === 400 ? 'Invalid JSON request body.' : 'Unable to process this request.' });
   });
 
   return app;

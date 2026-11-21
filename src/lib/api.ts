@@ -1,3 +1,5 @@
+import { getUser as getIdentityUser } from '@netlify/identity';
+
 const SESSION_STORAGE_KEY = 'prepwise_session_token';
 let memorySessionToken: string | null = null;
 
@@ -46,41 +48,54 @@ export class ApiError extends Error {
 
 export async function apiRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
   const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
-  const headers: Record<string, string> = isFormData
-    ? { ...(options.headers as Record<string, string> | undefined) }
-    : {
-        'Content-Type': 'application/json',
-        ...(options.headers as Record<string, string> | undefined),
-      };
-
+  const headers = new Headers(options.headers);
+  if (!isFormData && options.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  // Restoring the Identity session also starts automatic token refresh.
+  await getIdentityUser();
   const activeToken = getSessionToken();
-  if (activeToken && !headers.Authorization && !headers.authorization) {
-    headers.Authorization = `Bearer ${activeToken}`;
+  if (activeToken && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${activeToken}`);
   }
 
-  const response = await fetch(url, {
-    ...options,
-    headers,
-    credentials: 'include',
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...options, headers, credentials: 'include', cache: 'no-store',
+      signal: options.signal ?? AbortSignal.timeout(20000),
+    });
+  } catch (error) {
+    if (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name)) {
+      throw new ApiError('The request timed out. Please try again.', 0);
+    }
+    throw new ApiError('Unable to connect. Check your connection and try again.', 0);
+  }
 
   const contentType = response.headers.get('content-type') || '';
-  const data = contentType.includes('application/json') ? await response.json() : null;
-
-  if (data && typeof data === 'object' && typeof (data as { session_token?: unknown }).session_token === 'string') {
-    setSessionToken((data as { session_token: string }).session_token);
-  }
-  if (url === '/api/auth/logout') {
-    setSessionToken(null);
+  let data: any = null;
+  if (contentType.includes('application/json')) {
+    try {
+      data = await response.json();
+    } catch {
+      throw new ApiError('The server returned an invalid response. Please try again.', response.status);
+    }
+  } else {
+    throw new ApiError('The account service is unavailable. Please try again shortly.', response.status || 503);
   }
 
   if (!response.ok) {
     if (response.status === 401) {
       setSessionToken(null);
+      if (url !== '/api/auth/login' && typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('auth:unauthorized'));
+      }
     }
     const message = (data && typeof data.error === 'string' ? data.error : null) || `Request failed (${response.status})`;
     throw new ApiError(message, response.status);
   }
 
+  if (typeof data?.session_token === 'string') setSessionToken(data.session_token);
+  if (url === '/api/auth/logout' || (url === '/api/auth/me' && !data?.authenticated)) setSessionToken(null);
   return data as T;
 }
